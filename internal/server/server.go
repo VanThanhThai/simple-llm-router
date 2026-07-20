@@ -153,7 +153,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, consumer mod
 		if p := recover(); p != nil {
 			status = http.StatusInternalServerError
 			if sink == nil || !sink.Wrote() {
-				writeAPIError(w, &model.APIError{
+				writeAPIErrorFor(w, consumer, &model.APIError{
 					Status:  http.StatusInternalServerError,
 					Code:    "internal_error",
 					Message: "internal server error",
@@ -166,7 +166,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, consumer mod
 	if err != nil {
 		apiErr := bodyReadError(err)
 		status = apiErr.Status
-		writeAPIError(w, apiErr)
+		writeAPIErrorFor(w, consumer, apiErr)
 		return
 	}
 
@@ -177,7 +177,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, consumer mod
 			apiErr = model.ErrBadRequest(err.Error())
 		}
 		status = apiErr.Status
-		writeAPIError(w, apiErr)
+		writeAPIErrorFor(w, consumer, apiErr)
 		return
 	}
 	rec.ModelAlias = req.Model
@@ -211,7 +211,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, consumer mod
 				apiErr = model.ErrUpstreamUnavailable()
 			}
 			status = apiErr.Status
-			writeAPIError(w, apiErr)
+			writeAPIErrorFor(w, consumer, apiErr)
 		}
 	}
 }
@@ -317,13 +317,27 @@ func bodyReadError(err error) *model.APIError {
 	return model.ErrBadRequest("could not read request body")
 }
 
-// writeAPIError writes an OpenAI-shaped error document (ADR-0011). Per the
-// server contract this shape is used for every error response, including on the
-// Anthropic endpoint.
+// writeAPIError writes an OpenAI-shaped error document (ADR-0011). Prefer
+// writeAPIErrorFor on a request path that knows its consumer protocol.
 func writeAPIError(w http.ResponseWriter, e *model.APIError) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(e.Status)
 	_, _ = w.Write(e.Body())
+}
+
+// writeAPIErrorFor writes e in the envelope the consumer's protocol expects.
+// Errors raised before routing — auth, malformed JSON, unknown model — come from
+// the router itself rather than an upstream, so without this an Anthropic client
+// receives an OpenAI-shaped document from /v1/messages that its SDK cannot parse
+// and whose wording client-side retry logic matches on (ADR-0019).
+func writeAPIErrorFor(w http.ResponseWriter, consumer model.Protocol, e *model.APIError) {
+	if consumer != model.ProtocolAnthropic {
+		writeAPIError(w, e)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(e.Status)
+	_, _ = w.Write(anthropicErrorBody(e.Status, e.Body()))
 }
 
 // writeJSON marshals v and writes it with a JSON content type.

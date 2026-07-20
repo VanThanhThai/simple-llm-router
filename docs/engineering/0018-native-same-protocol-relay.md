@@ -19,9 +19,12 @@ Those two facts collide. Without a dedicated path, an Anthropic → Anthropic
 request would be translated **Anthropic → OpenAI** (inbound) then
 **OpenAI → Anthropic** (outbound) — a double translation through a lossy
 intermediate. The canonical `Raw` carries only `model`, `stream`, `max_tokens`,
-`temperature`, `top_p`, `stop`, `messages`, and `system`; it models none of
-`tools`, `tool_choice`, `top_k`, `metadata`, or `cache_control`, which would be
-**silently dropped**, breaking ADR-0016's promise.
+`temperature`, `top_p`, `stop`, `messages`, `system`, and — since the 2026-07-20
+revision of [ADR-0016](0016-multi-protocol.md) — `tools`, `tool_choice`, and
+`parallel_tool_calls`. It still models none of `top_k`, `metadata`, or
+`cache_control`, which would be **silently dropped**, breaking ADR-0016's
+promise. The native relay remains the only byte-intact path, and the only one
+that preserves those remaining Anthropic-native fields.
 
 The original bytes survive, though. `ChatRequest.ConsumerBody`
 (`internal/model/request.go`) holds the inbound body byte-for-byte in the

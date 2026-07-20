@@ -120,9 +120,10 @@ func TestAnthropicConsumerStreamTranslatesOpenAIBackend(t *testing.T) {
 // TestAnthropicToOpenAIDropsNativeOnlyFields covers the ADR-0018 SHOULD
 // (complementing the same-protocol survive test): when an Anthropic consumer is
 // routed cross-protocol to an OpenAI backend, the canonical translation carries
-// only OpenAI-meaningful fields, so the Anthropic-native extras tools,
-// tool_choice, top_k, metadata, and cache_control are ABSENT from the forwarded
-// upstream body (they would only survive on the same-protocol native relay).
+// only fields with an OpenAI meaning. tools and tool_choice now have one and are
+// translated (TestAnthropicToolsTranslateToOpenAI); top_k, metadata, and
+// cache_control still have none, so they remain ABSENT from the forwarded
+// upstream body — those survive only on the same-protocol native relay.
 func TestAnthropicToOpenAIDropsNativeOnlyFields(t *testing.T) {
 	be := &fakeBackend{name: "b1", protocol: model.ProtocolOpenAI, fn: okResponse(`{"id":"chatcmpl-1","model":"up-oai","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)}
 	srv := newServer(t,
@@ -147,7 +148,7 @@ func TestAnthropicToOpenAIDropsNativeOnlyFields(t *testing.T) {
 	}
 
 	// The Anthropic-native fields must not have crossed the canonical boundary.
-	for _, k := range []string{"tools", "tool_choice", "top_k", "metadata"} {
+	for _, k := range []string{"top_k", "metadata"} {
 		if _, ok := sent[k]; ok {
 			t.Fatalf("native-only field %q forwarded to OpenAI backend: %s", k, be.lastBody)
 		}
