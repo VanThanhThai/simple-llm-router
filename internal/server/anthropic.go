@@ -60,6 +60,31 @@ func parseAnthropicRequest(body []byte) (*model.ChatRequest, error) {
 	if ss, ok := in["stop_sequences"]; ok {
 		out["stop"] = ss
 	}
+	// Tool use crosses the canonical boundary: Anthropic tool definitions and
+	// tool_choice have direct OpenAI equivalents, so an agent loop survives the
+	// cross-protocol path (ADR-0016 revised).
+	if t, ok := in["tools"]; ok {
+		if tools := anthropicToolsToOpenAI(t); len(tools) > 0 {
+			if raw, err := json.Marshal(tools); err == nil {
+				out["tools"] = raw
+			}
+		}
+	}
+	if tc, ok := in["tool_choice"]; ok {
+		choice, parallel := anthropicToolChoiceToOpenAI(tc)
+		if choice != nil {
+			if raw, err := json.Marshal(choice); err == nil {
+				out["tool_choice"] = raw
+			}
+		}
+		// Anthropic spells "one tool at a time" as a flag on tool_choice;
+		// OpenAI spells it as a top-level parameter.
+		if parallel != nil {
+			if raw, err := json.Marshal(*parallel); err == nil {
+				out["parallel_tool_calls"] = raw
+			}
+		}
+	}
 	// Routing-control plugins are honored on either endpoint and stripped before
 	// forwarding (ADR-0001).
 	if p, ok := in["plugins"]; ok {
@@ -87,9 +112,7 @@ func parseAnthropicRequest(body []byte) (*model.ChatRequest, error) {
 		oaiMsgs = append(oaiMsgs, raw)
 	}
 	for _, m := range inMsgs {
-		content := translateAnthropicContent(m.Content)
-		raw, _ := json.Marshal(map[string]any{"role": m.Role, "content": content})
-		oaiMsgs = append(oaiMsgs, raw)
+		oaiMsgs = append(oaiMsgs, translateAnthropicMessage(m.Role, m.Content)...)
 	}
 
 	msgsRaw, _ := json.Marshal(oaiMsgs)
@@ -130,6 +153,231 @@ func anthropicSystemText(raw json.RawMessage) string {
 		}
 	}
 	return ""
+}
+
+// anthropicToolsToOpenAI maps Anthropic tool definitions to OpenAI function
+// tools. The only real difference is the wrapper: Anthropic puts name /
+// description / input_schema at the top level, OpenAI nests them under
+// "function" and calls the schema "parameters".
+func anthropicToolsToOpenAI(raw json.RawMessage) []any {
+	var tools []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return nil
+	}
+	out := make([]any, 0, len(tools))
+	for _, t := range tools {
+		fn := map[string]any{}
+		var name string
+		if v, ok := t["name"]; ok {
+			_ = json.Unmarshal(v, &name)
+		}
+		if name == "" {
+			continue // a nameless tool is not addressable; skip it
+		}
+		fn["name"] = name
+		if v, ok := t["description"]; ok {
+			var desc string
+			if json.Unmarshal(v, &desc) == nil && desc != "" {
+				fn["description"] = desc
+			}
+		}
+		if v, ok := t["input_schema"]; ok {
+			var schema any
+			if json.Unmarshal(v, &schema) == nil && schema != nil {
+				fn["parameters"] = schema
+			}
+		}
+		out = append(out, map[string]any{"type": "function", "function": fn})
+	}
+	return out
+}
+
+// anthropicToolChoiceToOpenAI maps an Anthropic tool_choice to the OpenAI form,
+// plus the OpenAI parallel_tool_calls parameter when Anthropic's
+// disable_parallel_tool_use flag is set. A nil choice means "not expressible" —
+// the caller then forwards nothing, leaving the provider default.
+func anthropicToolChoiceToOpenAI(raw json.RawMessage) (choice any, parallel *bool) {
+	var tc struct {
+		Type                   string `json:"type"`
+		Name                   string `json:"name"`
+		DisableParallelToolUse *bool  `json:"disable_parallel_tool_use"`
+	}
+	if err := json.Unmarshal(raw, &tc); err != nil {
+		return nil, nil
+	}
+	if tc.DisableParallelToolUse != nil {
+		enabled := !*tc.DisableParallelToolUse
+		parallel = &enabled
+	}
+	switch tc.Type {
+	case "auto":
+		return "auto", parallel
+	case "any":
+		// Anthropic "any" = must call some tool; OpenAI spells that "required".
+		return "required", parallel
+	case "none":
+		return "none", parallel
+	case "tool":
+		if tc.Name == "" {
+			return nil, parallel
+		}
+		return map[string]any{"type": "function", "function": map[string]any{"name": tc.Name}}, parallel
+	}
+	return nil, parallel
+}
+
+// translateAnthropicMessage maps one Anthropic message to one or more OpenAI
+// messages. Most turns map 1:1, but tool results do not: Anthropic carries them
+// as tool_result blocks inside a user turn, whereas OpenAI requires a separate
+// message per result with role "tool". A turn holding several tool_result blocks
+// therefore fans out into several OpenAI messages (ADR-0016 revised).
+func translateAnthropicMessage(role string, content json.RawMessage) []json.RawMessage {
+	t := bytes.TrimSpace(content)
+	if len(t) == 0 || t[0] != '[' {
+		raw, _ := json.Marshal(map[string]any{"role": role, "content": translateAnthropicContent(content)})
+		return []json.RawMessage{raw}
+	}
+
+	var blocks []map[string]json.RawMessage
+	if err := json.Unmarshal(t, &blocks); err != nil {
+		raw, _ := json.Marshal(map[string]any{"role": role, "content": ""})
+		return []json.RawMessage{raw}
+	}
+
+	parts := make([]any, 0, len(blocks))
+	toolCalls := make([]any, 0)
+	toolMsgs := make([]json.RawMessage, 0)
+	for _, b := range blocks {
+		switch anthropicBlockType(b) {
+		case "tool_use":
+			if call := anthropicToolUseToOpenAI(b); call != nil {
+				toolCalls = append(toolCalls, call)
+			}
+		case "tool_result":
+			if msg := anthropicToolResultToOpenAI(b); msg != nil {
+				toolMsgs = append(toolMsgs, msg)
+			}
+		default:
+			parts = append(parts, translateAnthropicBlock(b))
+		}
+	}
+
+	out := make([]json.RawMessage, 0, len(toolMsgs)+1)
+	// Tool results must precede any prose in the same turn: OpenAI requires each
+	// "tool" message to follow the assistant turn that requested it, and text the
+	// user added alongside belongs after those results.
+	out = append(out, toolMsgs...)
+	if len(parts) > 0 || len(toolCalls) > 0 {
+		m := map[string]any{"role": role}
+		if len(parts) > 0 {
+			m["content"] = parts
+		} else {
+			// An assistant turn that is purely tool calls carries no content;
+			// OpenAI expects null rather than an empty array here.
+			m["content"] = nil
+		}
+		if len(toolCalls) > 0 {
+			m["tool_calls"] = toolCalls
+		}
+		raw, _ := json.Marshal(m)
+		out = append(out, raw)
+	}
+	if len(out) == 0 {
+		raw, _ := json.Marshal(map[string]any{"role": role, "content": ""})
+		out = append(out, raw)
+	}
+	return out
+}
+
+// anthropicBlockType reads a content block's "type" discriminator.
+func anthropicBlockType(b map[string]json.RawMessage) string {
+	var typ string
+	if t, ok := b["type"]; ok {
+		_ = json.Unmarshal(t, &typ)
+	}
+	return typ
+}
+
+// anthropicToolUseToOpenAI maps a tool_use block to an OpenAI tool call. The
+// structured "input" object becomes OpenAI's JSON-string "arguments".
+func anthropicToolUseToOpenAI(b map[string]json.RawMessage) any {
+	var id, name string
+	if v, ok := b["id"]; ok {
+		_ = json.Unmarshal(v, &id)
+	}
+	if v, ok := b["name"]; ok {
+		_ = json.Unmarshal(v, &name)
+	}
+	if name == "" {
+		return nil
+	}
+	args := "{}"
+	if v, ok := b["input"]; ok && len(bytes.TrimSpace(v)) > 0 {
+		args = string(v)
+	}
+	return map[string]any{
+		"id":       id,
+		"type":     "function",
+		"function": map[string]any{"name": name, "arguments": args},
+	}
+}
+
+// anthropicToolResultToOpenAI maps a tool_result block to an OpenAI "tool"
+// message. OpenAI's tool content is plain text, so block content is flattened.
+func anthropicToolResultToOpenAI(b map[string]json.RawMessage) json.RawMessage {
+	var id string
+	if v, ok := b["tool_use_id"]; ok {
+		_ = json.Unmarshal(v, &id)
+	}
+	if id == "" {
+		return nil
+	}
+	text := ""
+	if v, ok := b["content"]; ok {
+		text = anthropicToolResultText(v)
+	}
+	raw, err := json.Marshal(map[string]any{
+		"role":         "tool",
+		"tool_call_id": id,
+		"content":      text,
+	})
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+// anthropicToolResultText flattens tool_result content — a string, or an array of
+// blocks — to the plain text OpenAI expects. Non-text blocks (e.g. an image
+// result) are skipped rather than rendered as JSON noise.
+func anthropicToolResultText(raw json.RawMessage) string {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 || string(t) == "null" {
+		return ""
+	}
+	if t[0] == '"' {
+		var s string
+		_ = json.Unmarshal(t, &s)
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(t, &blocks); err != nil {
+		return string(t)
+	}
+	var sb strings.Builder
+	for _, b := range blocks {
+		if b.Type != "text" || b.Text == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(b.Text)
+	}
+	return sb.String()
 }
 
 // translateAnthropicContent maps Anthropic message content (string or content
@@ -227,11 +475,22 @@ type anthropicSink struct {
 	stop    string
 	out     int
 	in      int
+
+	// Content-block bookkeeping. An Anthropic stream is a sequence of indexed
+	// blocks, each opened and closed in turn, whereas OpenAI streams text and
+	// tool-call fragments interleaved on one channel — so the sink allocates
+	// indices and tracks which block is currently open. Single-goroutine per
+	// request, so plain fields suffice (ADR-0015).
+	nextIndex int         // next block index to allocate
+	textIndex int         // index of the text block
+	textOpen  bool        // is the text block currently open?
+	toolIndex map[int]int // OpenAI tool_call index -> Anthropic block index
+	openTool  int         // currently open tool block, -1 when none
 }
 
 // newAnthropicSink builds a translating sink over w.
 func newAnthropicSink(w http.ResponseWriter) *anthropicSink {
-	return &anthropicSink{w: w, rc: http.NewResponseController(w)}
+	return &anthropicSink{w: w, rc: http.NewResponseController(w), openTool: -1}
 }
 
 // Wrote reports whether any byte has reached the client yet.
@@ -255,7 +514,7 @@ func (s *anthropicSink) WriteResponse(status int, header http.Header, body []byt
 	s.w.WriteHeader(status)
 	s.wrote = true
 	if status >= 400 {
-		_, err := s.w.Write(anthropicErrorBody(body))
+		_, err := s.w.Write(anthropicErrorBody(status, body))
 		return err
 	}
 	_, err := s.w.Write(translateCompletionToAnthropic(body))
@@ -342,11 +601,12 @@ func (s *anthropicSink) WriteEvent(data []byte) error {
 	if len(chunk.Choices) > 0 {
 		ch := chunk.Choices[0]
 		if text := contentText(ch.Delta.Content); text != "" {
-			if err := s.emit("content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": 0,
-				"delta": map[string]any{"type": "text_delta", "text": text},
-			}); err != nil {
+			if err := s.writeTextDelta(text); err != nil {
+				return err
+			}
+		}
+		for _, tc := range ch.Delta.ToolCalls {
+			if err := s.writeToolCallDelta(tc); err != nil {
 				return err
 			}
 		}
@@ -372,11 +632,19 @@ func (s *anthropicSink) EndStream() error {
 			return err
 		}
 	}
-	if err := s.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}); err != nil {
-		return err
+	// Close whatever is still open, in the order it was opened.
+	for s.textOpen || s.openTool >= 0 {
+		if err := s.closeOpenBlock(); err != nil {
+			return err
+		}
 	}
 	stop := s.stop
 	if stop == "" {
+		stop = "end_turn"
+	}
+	if stop == "tool_use" && len(s.toolIndex) == 0 {
+		// The upstream reported finish_reason tool_calls but never streamed a
+		// call; without a tool_use block that stop_reason would be malformed.
 		stop = "end_turn"
 	}
 	if err := s.emit("message_delta", map[string]any{
@@ -410,10 +678,97 @@ func (s *anthropicSink) emitStart() error {
 	}); err != nil {
 		return err
 	}
+	s.textIndex = 0
+	s.textOpen = true
+	s.nextIndex = 1
 	return s.emit("content_block_start", map[string]any{
 		"type":          "content_block_start",
 		"index":         0,
 		"content_block": map[string]any{"type": "text", "text": ""},
+	})
+}
+
+// closeOpenBlock emits content_block_stop for whichever block is open, if any.
+// Anthropic closes a block before the next one opens, so this runs whenever the
+// stream switches between text and a tool call, and again at EndStream.
+func (s *anthropicSink) closeOpenBlock() error {
+	switch {
+	case s.textOpen:
+		s.textOpen = false
+		return s.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.textIndex})
+	case s.openTool >= 0:
+		idx := s.openTool
+		s.openTool = -1
+		return s.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
+	}
+	return nil
+}
+
+// writeTextDelta appends to the text block, reopening a fresh one if a tool call
+// has closed it in the meantime (a provider may interleave prose and calls).
+func (s *anthropicSink) writeTextDelta(text string) error {
+	if !s.textOpen {
+		if err := s.closeOpenBlock(); err != nil {
+			return err
+		}
+		s.textIndex = s.nextIndex
+		s.nextIndex++
+		if err := s.emit("content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         s.textIndex,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		}); err != nil {
+			return err
+		}
+		s.textOpen = true
+	}
+	return s.emit("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": s.textIndex,
+		"delta": map[string]any{"type": "text_delta", "text": text},
+	})
+}
+
+// writeToolCallDelta translates one OpenAI tool-call fragment. The first fragment
+// for a given OpenAI index opens an Anthropic tool_use block; subsequent
+// fragments stream the accumulating arguments as input_json_delta, which is how
+// an Anthropic consumer reconstructs the call's input object.
+func (s *anthropicSink) writeToolCallDelta(tc oaiToolCallDelta) error {
+	if s.toolIndex == nil {
+		s.toolIndex = make(map[int]int, 2)
+	}
+	idx, seen := s.toolIndex[tc.Index]
+	if !seen {
+		if err := s.closeOpenBlock(); err != nil {
+			return err
+		}
+		idx = s.nextIndex
+		s.nextIndex++
+		s.toolIndex[tc.Index] = idx
+		if err := s.emit("content_block_start", map[string]any{
+			"type":  "content_block_start",
+			"index": idx,
+			"content_block": map[string]any{
+				"type":  "tool_use",
+				"id":    tc.ID,
+				"name":  tc.Function.Name,
+				"input": map[string]any{},
+			},
+		}); err != nil {
+			return err
+		}
+		s.openTool = idx
+		// A tool call means the turn ends in tool_use, even if the provider
+		// never sends a finish_reason (some stop the stream abruptly).
+		s.stop = "tool_use"
+	}
+	if tc.Function.Arguments == "" {
+		return nil
+	}
+	return s.emit("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": idx,
+		"delta": map[string]any{"type": "input_json_delta", "partial_json": tc.Function.Arguments},
 	})
 }
 
@@ -442,12 +797,36 @@ func (s *anthropicSink) emit(event string, payload any) error {
 
 // ----- OpenAI response shapes the translation reads -------------------------
 
+// oaiToolCall is a complete tool call on a unary OpenAI response.
+type oaiToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// oaiToolCallDelta is a streaming fragment of a tool call. OpenAI splits one call
+// across many chunks — the id and name arrive once, then "arguments" accumulates
+// a character at a time — and keys the fragments by Index.
+type oaiToolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
 type oaiCompletion struct {
 	ID      string `json:"id"`
 	Model   string `json:"model"`
 	Choices []struct {
 		Message struct {
-			Content json.RawMessage `json:"content"`
+			Content   json.RawMessage `json:"content"`
+			ToolCalls []oaiToolCall   `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -462,7 +841,8 @@ type oaiChunk struct {
 	Model   string `json:"model"`
 	Choices []struct {
 		Delta struct {
-			Content json.RawMessage `json:"content"`
+			Content   json.RawMessage    `json:"content"`
+			ToolCalls []oaiToolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -487,9 +867,35 @@ func translateCompletionToAnthropic(body []byte) []byte {
 
 	text := ""
 	stop := "end_turn"
+	var toolCalls []oaiToolCall
 	if len(comp.Choices) > 0 {
 		text = contentText(comp.Choices[0].Message.Content)
 		stop = openAIFinishToAnthropicStop(comp.Choices[0].FinishReason)
+		toolCalls = comp.Choices[0].Message.ToolCalls
+	}
+
+	// Text first, then one tool_use block per call — the block order Anthropic
+	// consumers expect. Emitting stop_reason "tool_use" with no tool_use block
+	// would be a malformed response, so the two are derived together.
+	content := make([]any, 0, len(toolCalls)+1)
+	if text != "" || len(toolCalls) == 0 {
+		content = append(content, map[string]any{"type": "text", "text": text})
+	}
+	for _, tc := range toolCalls {
+		content = append(content, map[string]any{
+			"type":  "tool_use",
+			"id":    tc.ID,
+			"name":  tc.Function.Name,
+			"input": toolArgumentsToInput(tc.Function.Arguments),
+		})
+	}
+	switch {
+	case len(toolCalls) > 0:
+		stop = "tool_use"
+	case stop == "tool_use":
+		// The upstream reported finish_reason tool_calls but sent no calls;
+		// without a tool_use block that stop_reason would be malformed.
+		stop = "end_turn"
 	}
 
 	out, err := json.Marshal(map[string]any{
@@ -497,7 +903,7 @@ func translateCompletionToAnthropic(body []byte) []byte {
 		"type":          "message",
 		"role":          "assistant",
 		"model":         comp.Model,
-		"content":       []any{map[string]any{"type": "text", "text": text}},
+		"content":       content,
 		"stop_reason":   stop,
 		"stop_sequence": nil,
 		"usage": map[string]any{
@@ -511,9 +917,11 @@ func translateCompletionToAnthropic(body []byte) []byte {
 	return out
 }
 
-// anthropicErrorBody wraps an upstream OpenAI-style error into the Anthropic
-// error envelope (best-effort, ADR-0016).
-func anthropicErrorBody(body []byte) []byte {
+// anthropicErrorBody wraps an OpenAI-style error into the Anthropic error
+// envelope (best-effort, ADR-0016/ADR-0019). Anthropic clients match on the
+// error type, so it is derived from the status rather than always reported as a
+// generic api_error.
+func anthropicErrorBody(status int, body []byte) []byte {
 	msg := "request failed"
 	var e struct {
 		Error struct {
@@ -525,12 +933,34 @@ func anthropicErrorBody(body []byte) []byte {
 	}
 	out, err := json.Marshal(map[string]any{
 		"type":  "error",
-		"error": map[string]any{"type": "api_error", "message": msg},
+		"error": map[string]any{"type": anthropicErrorType(status), "message": msg},
 	})
 	if err != nil {
 		return body
 	}
 	return out
+}
+
+// anthropicErrorType maps an HTTP status to the Anthropic error type string.
+func anthropicErrorType(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case 529:
+		return "overloaded_error"
+	default:
+		return "api_error"
+	}
 }
 
 // contentText extracts a plain-text view of an OpenAI content value (string or
@@ -544,6 +974,21 @@ func contentText(raw json.RawMessage) string {
 		return ""
 	}
 	return c.Text()
+}
+
+// toolArgumentsToInput turns an OpenAI tool call's JSON-string "arguments" into
+// the structured object Anthropic's tool_use "input" expects. Providers
+// occasionally emit an empty or malformed string; an empty object keeps the
+// response well-formed rather than failing the whole translation.
+func toolArgumentsToInput(arguments string) any {
+	if strings.TrimSpace(arguments) == "" {
+		return map[string]any{}
+	}
+	var input any
+	if err := json.Unmarshal([]byte(arguments), &input); err != nil || input == nil {
+		return map[string]any{}
+	}
+	return input
 }
 
 // openAIFinishToAnthropicStop maps an OpenAI finish_reason to the Anthropic

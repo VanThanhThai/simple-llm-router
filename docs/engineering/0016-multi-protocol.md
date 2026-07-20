@@ -74,24 +74,45 @@ same-protocol candidate over the cheapest.
 | OpenAI → OpenAI | passthrough | full ([ADR-0001](0001-transparent-openai-passthrough.md)) |
 | Anthropic → Anthropic | native relay ([ADR-0018](0018-native-same-protocol-relay.md)) | full |
 | OpenAI → Anthropic | translate via canonical | best-effort; provider extras may drop |
-| Anthropic → OpenAI | translate via canonical | best-effort; provider extras may drop |
+| Anthropic → OpenAI | translate via canonical | tool use translated; other provider extras may drop |
+
+> [!NOTE]
+> **Anthropic → OpenAI carries tool use** (revised 2026-07-20; this ADR
+> previously declared tool use out of scope for the canonical pivot). The pivot
+> ([ADR-0017](0017-canonical-openai-pivot.md)) is OpenAI-shaped, so tool fields
+> have a natural home in it, and the Anthropic adapter now maps them in both
+> directions:
+>
+> - **Request:** `tools` → OpenAI function tools (`input_schema` →
+>   `parameters`); `tool_choice` `auto`/`any`/`none`/`tool` →
+>   `auto`/`required`/`none`/named function, with `disable_parallel_tool_use` →
+>   `parallel_tool_calls`.
+> - **Messages:** assistant `tool_use` blocks → `tool_calls` (structured `input`
+>   → JSON-string `arguments`); each user `tool_result` block → its own
+>   `role: "tool"` message. One Anthropic turn may therefore fan out into
+>   several OpenAI messages.
+> - **Response:** `tool_calls` → `tool_use` content blocks, unary and streaming
+>   (`content_block_start` + `input_json_delta`). `stop_reason: "tool_use"` is
+>   now always accompanied by the blocks it refers to, where previously it could
+>   be returned with a text-only body.
+>
+> This makes an Anthropic-native agent loop — including Claude Code and the
+> Claude Agent SDK — usable against an OpenAI-compatible backend, which the
+> same-protocol requirement below otherwise rules out.
 
 > [!WARNING]
-> **Cross-protocol translation drops tool use.** The canonical pivot
-> ([ADR-0017](0017-canonical-openai-pivot.md)) carries only text/multimodal
-> message content; it has no representation for OpenAI `tool_calls` /
-> `tool_choice` / `tools` or Anthropic `tool_use` / `tool_result` blocks. On
-> either translated cell of the matrix above these are **silently dropped** —
-> an OpenAI consumer calling tools against an Anthropic backend (or the reverse)
-> can therefore receive a response with **empty content** (the model emitted a
-> tool call, which the translator cannot represent, so nothing survives). Agents
-> that depend on tool calling **MUST** use a same-protocol path: OpenAI→OpenAI
+> **The OpenAI → Anthropic direction still drops tool use.** Nothing maps OpenAI
+> `tools` / `tool_choice` onto an Anthropic backend, nor Anthropic `tool_use`
+> blocks back onto `tool_calls`, so on that cell they are **silently dropped**
+> and the consumer can receive a response with **empty content** (the model
+> emitted a tool call the translator cannot represent). An OpenAI consumer that
+> depends on tool calling **MUST** use a same-protocol path: OpenAI→OpenAI
 > passthrough ([ADR-0001](0001-transparent-openai-passthrough.md)) or
 > Anthropic→Anthropic native relay
-> ([ADR-0018](0018-native-same-protocol-relay.md)), both of which are
-> **full-fidelity** and forward tool fields byte-intact. The same-protocol
-> preference above makes this the default whenever a matching backend exists;
-> tool-using workloads should be configured so one always does.
+> ([ADR-0018](0018-native-same-protocol-relay.md)), both **full-fidelity** and
+> byte-intact. Independently of tool use, `top_k`, `metadata`, and
+> `cache_control` still have no canonical representation in either translated
+> direction.
 
 Streaming ([ADR-0007](0007-streaming.md)) and multimodal content
 ([ADR-0008](0008-multimodal-and-large-bodies.md)) are translated by the same

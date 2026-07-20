@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/mattbucci/simple-llm-router/internal/model"
 )
 
 // TestStaticTokenAuth covers ADR-0009: when tokens are configured a matching
@@ -57,7 +59,7 @@ func TestAuthedStripsInboundCredential(t *testing.T) {
 	r.Header.Set("X-Api-Key", "consumer-key")
 	rec := httptest.NewRecorder()
 
-	s.authed(next).ServeHTTP(rec, r)
+	s.authed(model.ProtocolOpenAI, next).ServeHTTP(rec, r)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -79,7 +81,7 @@ func TestAuthRejects401(t *testing.T) {
 
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
-	s.authed(next).ServeHTTP(rec, r)
+	s.authed(model.ProtocolOpenAI, next).ServeHTTP(rec, r)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
