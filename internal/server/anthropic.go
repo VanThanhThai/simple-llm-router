@@ -254,9 +254,7 @@ func translateAnthropicMessage(role string, content json.RawMessage) []json.RawM
 				toolCalls = append(toolCalls, call)
 			}
 		case "tool_result":
-			if msg := anthropicToolResultToOpenAI(b); msg != nil {
-				toolMsgs = append(toolMsgs, msg)
-			}
+			toolMsgs = append(toolMsgs, anthropicToolResultToOpenAI(b)...)
 		default:
 			parts = append(parts, translateAnthropicBlock(b))
 		}
@@ -322,9 +320,22 @@ func anthropicToolUseToOpenAI(b map[string]json.RawMessage) any {
 	}
 }
 
-// anthropicToolResultToOpenAI maps a tool_result block to an OpenAI "tool"
-// message. OpenAI's tool content is plain text, so block content is flattened.
-func anthropicToolResultToOpenAI(b map[string]json.RawMessage) json.RawMessage {
+// anthropicToolResultToOpenAI maps a tool_result block to the OpenAI messages it
+// needs — usually one, but two when the result carries an image.
+//
+// OpenAI's role:"tool" content is text-only and has no representation for image
+// parts, while an Anthropic tool_result may contain them (a Read tool returning
+// a photo, for instance). Dropping those pixels does not produce an error: the
+// model receives an empty result and answers about an image it never saw, which
+// in practice means a fluent, confident, entirely invented answer. So an
+// image-bearing result additionally emits a role:"user" message carrying the
+// images as image_url parts, using the same base64 -> data: URI conversion
+// translateAnthropicBlock already performs for ordinary image content.
+//
+// The role:"tool" message is always emitted, even when the result is nothing but
+// an image: OpenAI requires every tool_call to be answered by a matching tool
+// message, and omitting it makes the whole request invalid.
+func anthropicToolResultToOpenAI(b map[string]json.RawMessage) []json.RawMessage {
 	var id string
 	if v, ok := b["tool_use_id"]; ok {
 		_ = json.Unmarshal(v, &id)
@@ -332,52 +343,81 @@ func anthropicToolResultToOpenAI(b map[string]json.RawMessage) json.RawMessage {
 	if id == "" {
 		return nil
 	}
-	text := ""
+
+	var text string
+	var images []any
 	if v, ok := b["content"]; ok {
-		text = anthropicToolResultText(v)
+		text, images = anthropicToolResultParts(v)
 	}
-	raw, err := json.Marshal(map[string]any{
+	if text == "" && len(images) > 0 {
+		// Never leave the tool reply blank — the model has to see that the call
+		// succeeded, and the pointer keeps the two messages legible in a log.
+		text = "(image returned; see the following message)"
+	}
+
+	out := make([]json.RawMessage, 0, 2)
+	if raw, err := json.Marshal(map[string]any{
 		"role":         "tool",
 		"tool_call_id": id,
 		"content":      text,
-	})
-	if err != nil {
-		return nil
+	}); err == nil {
+		out = append(out, raw)
 	}
-	return raw
+	if len(images) > 0 {
+		if raw, err := json.Marshal(map[string]any{
+			"role":    "user",
+			"content": images,
+		}); err == nil {
+			out = append(out, raw)
+		}
+	}
+	return out
 }
 
-// anthropicToolResultText flattens tool_result content — a string, or an array of
-// blocks — to the plain text OpenAI expects. Non-text blocks (e.g. an image
-// result) are skipped rather than rendered as JSON noise.
-func anthropicToolResultText(raw json.RawMessage) string {
+// anthropicToolResultParts splits tool_result content — a string, or an array of
+// blocks — into the text OpenAI's tool role accepts and any image parts that
+// have to travel separately.
+func anthropicToolResultParts(raw json.RawMessage) (string, []any) {
 	t := bytes.TrimSpace(raw)
 	if len(t) == 0 || string(t) == "null" {
-		return ""
+		return "", nil
 	}
 	if t[0] == '"' {
 		var s string
 		_ = json.Unmarshal(t, &s)
-		return s
+		return s, nil
 	}
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
+
+	var blocks []map[string]json.RawMessage
 	if err := json.Unmarshal(t, &blocks); err != nil {
-		return string(t)
+		return string(t), nil
 	}
+
 	var sb strings.Builder
+	var images []any
 	for _, b := range blocks {
-		if b.Type != "text" || b.Text == "" {
-			continue
+		switch anthropicBlockType(b) {
+		case "text":
+			var s string
+			if v, ok := b["text"]; ok {
+				_ = json.Unmarshal(v, &s)
+			}
+			if s == "" {
+				continue
+			}
+			if sb.Len() > 0 {
+				sb.WriteByte('\n')
+			}
+			sb.WriteString(s)
+		case "image":
+			if part, ok := translateAnthropicBlock(b).(map[string]any); ok && part["type"] == "image_url" {
+				images = append(images, part)
+			}
 		}
-		if sb.Len() > 0 {
-			sb.WriteByte('\n')
-		}
-		sb.WriteString(b.Text)
+		// Any other block type is not representable in a tool reply and is
+		// skipped, as before.
 	}
-	return sb.String()
+	return sb.String(), images
 }
 
 // translateAnthropicContent maps Anthropic message content (string or content

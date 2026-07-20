@@ -469,3 +469,107 @@ func TestToolCallsFinishWithoutCallsDowngradesStopReason(t *testing.T) {
 		}
 	})
 }
+
+// TestAnthropicImageToolResultSurvives is the regression guard for the bug that
+// made every vision call fabricate. OpenAI's role:"tool" content is text-only, so
+// an image returned by a tool used to be dropped silently — the model then
+// answered about an image it never received, inventing a fluent, confident,
+// entirely wrong result. Nothing errored, which is what made it dangerous.
+//
+// The image must therefore reach the backend as an image_url part on a
+// role:"user" message that follows the tool reply, and the tool reply itself must
+// still be present so every tool_call is answered.
+func TestAnthropicImageToolResultSurvives(t *testing.T) {
+	// 1x1 GIF — small enough to inline, real enough to round-trip.
+	const b64 = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+
+	be := &fakeBackend{name: "b1", protocol: model.ProtocolOpenAI, fn: okResponse(`{"id":"c","model":"up-oai","choices":[{"index":0,"message":{"content":"a receipt"},"finish_reason":"stop"}]}`)}
+	srv := toolServer(t, be)
+
+	rec := srv.post(`{"model":"alias-oai","max_tokens":64,"messages":[` +
+		`{"role":"user","content":"read this receipt"},` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"/tmp/r.gif"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[` +
+		`{"type":"image","source":{"type":"base64","media_type":"image/gif","data":"` + b64 + `"}}` +
+		`]}]}` +
+		`]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+
+	var sent struct {
+		Messages []struct {
+			Role       string          `json:"role"`
+			Content    json.RawMessage `json:"content"`
+			ToolCallID string          `json:"tool_call_id"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(be.lastBody, &sent); err != nil {
+		t.Fatalf("forwarded body: %v", err)
+	}
+
+	// The pixels must be somewhere in the forwarded body. This is the assertion
+	// that fails against the pre-fix translator.
+	if !strings.Contains(string(be.lastBody), b64) {
+		t.Fatalf("image data dropped from the forwarded body — the model would answer blind:\n%s", be.lastBody)
+	}
+
+	// Every tool_call still needs its tool reply, or the request is invalid.
+	var toolMsg, userImageMsg int
+	for _, m := range sent.Messages {
+		if m.Role == "tool" && m.ToolCallID == "toolu_1" {
+			toolMsg++
+			if len(m.Content) == 0 || string(m.Content) == `""` {
+				t.Fatalf("tool reply is empty; the model cannot tell the call succeeded: %s", be.lastBody)
+			}
+		}
+		if m.Role == "user" && strings.Contains(string(m.Content), "image_url") {
+			userImageMsg++
+		}
+	}
+	if toolMsg != 1 {
+		t.Fatalf("expected exactly one tool reply for toolu_1, got %d: %s", toolMsg, be.lastBody)
+	}
+	if userImageMsg != 1 {
+		t.Fatalf("expected the image on one role:\"user\" message, got %d: %s", userImageMsg, be.lastBody)
+	}
+
+	// It must be a proper data: URI, not raw base64 — that is what an OpenAI
+	// backend actually accepts.
+	if !strings.Contains(string(be.lastBody), "data:image/gif;base64,") {
+		t.Fatalf("image not encoded as a data: URI: %s", be.lastBody)
+	}
+}
+
+// TestAnthropicTextToolResultUnchanged pins the common path: a text-only tool
+// result must still produce exactly one role:"tool" message and no extra user
+// turn. This is what the original tool-use work verified, and it must not
+// regress while making room for images.
+func TestAnthropicTextToolResultUnchanged(t *testing.T) {
+	be := &fakeBackend{name: "b1", protocol: model.ProtocolOpenAI, fn: okResponse(`{"id":"c","model":"up-oai","choices":[{"index":0,"message":{"content":"ok"},"finish_reason":"stop"}]}`)}
+	srv := toolServer(t, be)
+
+	rec := srv.post(`{"model":"alias-oai","max_tokens":64,"messages":[` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"calc","input":{}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"42"}]}` +
+		`]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+
+	var sent struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(be.lastBody, &sent); err != nil {
+		t.Fatalf("forwarded body: %v", err)
+	}
+	if len(sent.Messages) != 2 {
+		t.Fatalf("text tool result should stay 2 messages (assistant+tool), got %d: %s", len(sent.Messages), be.lastBody)
+	}
+	if sent.Messages[1].Role != "tool" || !strings.Contains(string(sent.Messages[1].Content), "42") {
+		t.Fatalf("text tool result lost: %s", be.lastBody)
+	}
+}
