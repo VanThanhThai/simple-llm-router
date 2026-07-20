@@ -368,3 +368,104 @@ func TestAnthropicPreRoutingErrorUsesAnthropicEnvelope(t *testing.T) {
 		t.Fatalf("error message dropped: %s", rec.Body.String())
 	}
 }
+
+// TestAnthropicAuthErrorUsesAnthropicEnvelope covers the earliest pre-routing
+// failure of all: rejection by the auth middleware. It runs before handleChat, so
+// it must pick the envelope from the endpoint rather than a parsed request — a
+// misconfigured Anthropic client's very first error is this one, and an
+// OpenAI-shaped 401 is unparseable by its SDK (ADR-0009, ADR-0019).
+func TestAnthropicAuthErrorUsesAnthropicEnvelope(t *testing.T) {
+	be := &fakeBackend{name: "b1", protocol: model.ProtocolOpenAI, fn: okResponse(`{"id":"c","model":"up-oai","choices":[]}`)}
+	srv := newServer(t,
+		map[string]router.Backend{"b1": be},
+		map[string]*router.Alias{"alias-oai": proxyAlias("alias-oai", "up-oai", "b1")},
+		snapshot(model.BackendState{Name: "b1", Healthy: true}),
+		[]string{"sk-router-test"}, io.Discard,
+	)
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"alias-oai","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (%s)", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("error body: %v", err)
+	}
+	if got.Type != "error" || got.Error.Type != "authentication_error" {
+		t.Fatalf("401 on /v1/messages = %s, want Anthropic envelope with authentication_error", rec.Body.String())
+	}
+
+	// The OpenAI endpoint must keep the OpenAI error shape.
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"alias-oai","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (%s)", rec.Code, rec.Body.String())
+	}
+	var oai struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &oai); err != nil || oai.Error.Code != "unauthorized" {
+		t.Fatalf("401 on /v1/chat/completions = %s, want OpenAI envelope with code unauthorized", rec.Body.String())
+	}
+}
+
+// TestToolCallsFinishWithoutCallsDowngradesStopReason pins the response contract
+// the hard way: a degenerate upstream that reports finish_reason "tool_calls"
+// without sending any tool call must NOT surface stop_reason "tool_use" — that
+// stop reason obliges the router to also deliver the tool_use blocks it refers
+// to, and there are none.
+func TestToolCallsFinishWithoutCallsDowngradesStopReason(t *testing.T) {
+	t.Run("unary", func(t *testing.T) {
+		be := &fakeBackend{name: "b1", protocol: model.ProtocolOpenAI, fn: okResponse(
+			`{"id":"c","model":"up-oai","choices":[{"index":0,"message":{"role":"assistant","content":"half an answer"},"finish_reason":"tool_calls"}]}`)}
+		srv := toolServer(t, be)
+		rec := srv.post(`{"model":"alias-oai","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d (%s)", rec.Code, rec.Body.String())
+		}
+		var got struct {
+			StopReason string `json:"stop_reason"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("response body: %v", err)
+		}
+		if got.StopReason != "end_turn" {
+			t.Fatalf("stop_reason = %q, want end_turn (no tool_use block was emitted): %s", got.StopReason, rec.Body.String())
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		sse := strings.Join([]string{
+			`data: {"id":"chatcmpl-x","model":"up-oai","choices":[{"index":0,"delta":{"role":"assistant","content":"half"},"finish_reason":null}]}`,
+			"",
+			`data: {"id":"chatcmpl-x","model":"up-oai","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			"",
+			"data: [DONE]",
+			"",
+			"",
+		}, "\n")
+		be := &fakeBackend{name: "b1", protocol: model.ProtocolOpenAI, fn: streamResponse(sse)}
+		srv := toolServer(t, be)
+		rec := srv.post(`{"model":"alias-oai","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d (%s)", rec.Code, rec.Body.String())
+		}
+		body := rec.Body.String()
+		if strings.Contains(body, `"stop_reason":"tool_use"`) {
+			t.Fatalf("stream reported stop_reason tool_use without any tool_use block:\n%s", body)
+		}
+		if !strings.Contains(body, `"stop_reason":"end_turn"`) {
+			t.Fatalf("stream did not downgrade to end_turn:\n%s", body)
+		}
+	})
+}

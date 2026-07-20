@@ -85,9 +85,9 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	// Consumer endpoints — protocol is decided by the endpoint hit (ADR-0016).
-	mux.Handle("POST /v1/chat/completions", s.authed(http.HandlerFunc(s.handleOpenAIChat)))
-	mux.Handle("POST /v1/messages", s.authed(http.HandlerFunc(s.handleAnthropicMessages)))
-	mux.Handle("GET /v1/models", s.authed(http.HandlerFunc(s.handleModels)))
+	mux.Handle("POST /v1/chat/completions", s.authed(model.ProtocolOpenAI, http.HandlerFunc(s.handleOpenAIChat)))
+	mux.Handle("POST /v1/messages", s.authed(model.ProtocolAnthropic, http.HandlerFunc(s.handleAnthropicMessages)))
+	mux.Handle("GET /v1/models", s.authed(model.ProtocolOpenAI, http.HandlerFunc(s.handleModels)))
 
 	// Audio gateway endpoints — registered only when the gateway is configured, so
 	// otherwise these paths 404 (ADR-0022). They reuse the inbound auth middleware
@@ -95,7 +95,7 @@ func (s *Server) Handler() http.Handler {
 	// to its local or cloud engine. The /v1/voices subtree is registered
 	// method-less so list/register/delete (and any /{id} child) all pass through.
 	if s.audioProxy != nil {
-		h := s.authed(s.audioHandler(s.audioProxy))
+		h := s.authed(model.ProtocolOpenAI, s.audioHandler(s.audioProxy))
 		mux.Handle("POST /v1/audio/speech", h)
 		mux.Handle("POST /v1/audio/transcriptions", h)
 		mux.Handle("POST /v1/audio/isolation", h)

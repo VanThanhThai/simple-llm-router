@@ -642,6 +642,11 @@ func (s *anthropicSink) EndStream() error {
 	if stop == "" {
 		stop = "end_turn"
 	}
+	if stop == "tool_use" && len(s.toolIndex) == 0 {
+		// The upstream reported finish_reason tool_calls but never streamed a
+		// call; without a tool_use block that stop_reason would be malformed.
+		stop = "end_turn"
+	}
 	if err := s.emit("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
@@ -884,8 +889,13 @@ func translateCompletionToAnthropic(body []byte) []byte {
 			"input": toolArgumentsToInput(tc.Function.Arguments),
 		})
 	}
-	if len(toolCalls) > 0 {
+	switch {
+	case len(toolCalls) > 0:
 		stop = "tool_use"
+	case stop == "tool_use":
+		// The upstream reported finish_reason tool_calls but sent no calls;
+		// without a tool_use block that stop_reason would be malformed.
+		stop = "end_turn"
 	}
 
 	out, err := json.Marshal(map[string]any{

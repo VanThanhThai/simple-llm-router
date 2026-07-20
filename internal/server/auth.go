@@ -73,10 +73,13 @@ func extractToken(r *http.Request) string {
 // authed wraps a handler with the inbound auth check and strips the consumer
 // credential at the trust boundary so it is never forwarded upstream
 // (ADR-0009): backends only ever see the router's own injected credential.
-func (s *Server) authed(next http.Handler) http.Handler {
+// The rejection is written in the consumer protocol's error envelope — the
+// endpoint decides the protocol (ADR-0016), so the caller passes it in
+// (ADR-0019).
+func (s *Server) authed(consumer model.Protocol, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.auth.Authenticate(r) {
-			writeAPIError(w, &model.APIError{
+			writeAPIErrorFor(w, consumer, &model.APIError{
 				Status:  http.StatusUnauthorized,
 				Code:    "unauthorized",
 				Message: "missing or invalid credentials",
